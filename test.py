@@ -77,13 +77,12 @@ if __name__ == "__main__":
     parser.add_argument('--save_images', action='store_true', help='Whether to save output images')
     args = parser.parse_args()
 
-    torch.cuda.set_device(args.cuda)
     device = torch.device(f'cuda:{args.cuda}' if torch.cuda.is_available() else 'cpu')
 
     # 加载模型
     testopt = parser.parse_args() 
     ckpt_path = testopt.ckpt_name
-    net = AdaIRModel().load_from_checkpoint(ckpt_path)
+    net = AdaIRModel().load_from_checkpoint(ckpt_path, strict=False)
     net = net.to(device)
     net.eval()
 
