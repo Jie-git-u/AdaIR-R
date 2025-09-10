@@ -367,88 +367,172 @@ class FreModule(nn.Module):
 
 
 ##########################################################################
-##---------- AdaIR -----------------------
+##---------- Task Embedding -----------------------
+class TaskEmbedding(nn.Module):
+    def __init__(self, num_tasks, embed_dim, feat_h, feat_w):
+        super(TaskEmbedding, self).__init__()
+        self.embedding = nn.Embedding(num_tasks, embed_dim)  # 任务嵌入向量
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim * feat_h * feat_w),
+        )
+        self.feat_h = feat_h
+        self.feat_w = feat_w
+        self.embed_dim = embed_dim
 
+    def forward(self, task_ids):
+        # task_ids: [B]
+        emb = self.embedding(task_ids)  # [B, embed_dim]
+        emb = self.mlp(emb)  # [B, embed_dim*H*W]
+        emb = emb.view(-1, self.embed_dim, self.feat_h, self.feat_w)  # [B, C, H, W]
+        return emb
+    
+    # zhj 2025.8.2 添加
+    def get_embedding(self, task_ids):
+        """
+        返回每个任务的嵌入向量，用于 TaskAwareModulation
+        """
+        return self.embedding(task_ids)  # [B, task_dim]
+
+##########################################################################
+##---------- TaskAwareModulation -----------------------
+class TaskAwareModulation(nn.Module):
+    def __init__(self, task_dim, feat_channels, reduction=16):
+        super().__init__()
+        self.fc1 = nn.Linear(task_dim, feat_channels // reduction)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(feat_channels // reduction, feat_channels * 2)
+
+    def forward(self, features, task_embed):
+        x = self.relu(self.fc1(task_embed))  # B x r
+        x = self.fc2(x)                      # B x 2C
+        scale, bias = x.chunk(2, dim=1)      # B x C each
+        scale = scale.unsqueeze(-1).unsqueeze(-1)  # B x C x 1 x 1
+        bias = bias.unsqueeze(-1).unsqueeze(-1)
+        return features * (1 + scale) + bias
+    
+##########################################################################
+##---------- AdaIR -----------------------
 class AdaIR(nn.Module):
     def __init__(self, 
-        inp_channels=3, 
-        out_channels=3, 
-        dim = 48,
-        num_blocks = [4,6,6,8], 
-        num_refinement_blocks = 4,
-        heads = [1,2,4,8],
-        ffn_expansion_factor = 2.66,
-        bias = False,
-        LayerNorm_type = 'WithBias', 
-        decoder = True,
-    ):
-
+                 inp_channels=3, 
+                 out_channels=3, 
+                 dim=48,
+                 num_blocks=[4,6,6,8], 
+                 num_refinement_blocks=4,
+                 heads=[1,2,4,8],
+                 ffn_expansion_factor=2.66,
+                 bias=False,
+                 LayerNorm_type='WithBias',
+                 decoder=True,
+                 num_tasks=6,
+                 task_embed_dim=48,
+                 task_embed_size=(128,128)  # 任务嵌入映射成特征图大小，建议与输入patch尺寸一致或接近
+                ):
         super(AdaIR, self).__init__()
 
-        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)        
+        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
         self.decoder = decoder
-        
+
+        # 任务嵌入模块
+        self.task_embed = TaskEmbedding(num_tasks, task_embed_dim, task_embed_size[0], task_embed_size[1])
+
         if self.decoder:
             self.fre1 = FreModule(dim*2**3, num_heads=heads[2], bias=bias)
             self.fre2 = FreModule(dim*2**2, num_heads=heads[2], bias=bias)
-            self.fre3 = FreModule(dim*2**1, num_heads=heads[2], bias=bias)            
+            self.fre3 = FreModule(dim*2**1, num_heads=heads[2], bias=bias)
 
-        self.encoder_level1 = nn.Sequential(*[TransformerBlock(dim=dim, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
+        self.encoder_level1 = nn.Sequential(*[
+            TransformerBlock(dim=dim, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
+            for _ in range(num_blocks[0])
+        ])
+
+        self.down1_2 = Downsample(dim)
+        self.encoder_level2 = nn.Sequential(*[
+            TransformerBlock(dim=dim*2, num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
+            for _ in range(num_blocks[1])
+        ])
         
-        self.down1_2 = Downsample(dim) ## From Level 1 to Level 2
+        self.task_mod2 = TaskAwareModulation(
+            task_dim=task_embed_dim, 
+            feat_channels=dim * 2  # encoder_level2 的输出通道
+        ) # zhj 2025.8.2修改
 
-        self.encoder_level2 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[1])])
-        
-        self.down2_3 = Downsample(int(dim*2**1)) ## From Level 2 to Level 3
+        self.down2_3 = Downsample(dim*2)
+        self.encoder_level3 = nn.Sequential(*[
+            TransformerBlock(dim=dim*4, num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
+            for _ in range(num_blocks[2])
+        ])
 
-        self.encoder_level3 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**2), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[2])])
+        self.down3_4 = Downsample(dim*4)
+        self.latent = nn.Sequential(*[
+            TransformerBlock(dim=dim*8, num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
+            for _ in range(num_blocks[3])
+        ])
 
-        self.down3_4 = Downsample(int(dim*2**2)) ## From Level 3 to Level 4
-        self.latent = nn.Sequential(*[TransformerBlock(dim=int(dim*2**3), num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[3])])
-        
-        self.up4_3 = Upsample(int(dim*2**3)) ## From Level 4 to Level 3
-        self.reduce_chan_level3 = nn.Conv2d(int(dim*2**3), int(dim*2**2), kernel_size=1, bias=bias)
+        self.up4_3 = Upsample(dim*8)
+        self.reduce_chan_level3 = nn.Conv2d(dim*8, dim*4, kernel_size=1, bias=bias)
+        self.decoder_level3 = nn.Sequential(*[
+            TransformerBlock(dim=dim*4, num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
+            for _ in range(num_blocks[2])
+        ])
 
-        self.decoder_level3 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**2), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[2])])
+        self.up3_2 = Upsample(dim*4)
+        self.reduce_chan_level2 = nn.Conv2d(dim*4, dim*2, kernel_size=1, bias=bias)
+        self.decoder_level2 = nn.Sequential(*[
+            TransformerBlock(dim=dim*2, num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
+            for _ in range(num_blocks[1])
+        ])
 
-        self.up3_2 = Upsample(int(dim*2**2)) 
-        self.reduce_chan_level2 = nn.Conv2d(int(dim*2**2), int(dim*2**1), kernel_size=1, bias=bias)
-        self.decoder_level2 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[1])])
-        
-        self.up2_1 = Upsample(int(dim*2**1)) 
+        self.up2_1 = Upsample(dim*2)
+        self.decoder_level1 = nn.Sequential(*[
+            TransformerBlock(dim=dim*2, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
+            for _ in range(num_blocks[0])
+        ])
 
-        self.decoder_level1 = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
-        
-        self.refinement = nn.Sequential(*[TransformerBlock(dim=int(dim*2**1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_refinement_blocks)])
-                    
-        self.output = nn.Conv2d(int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.refinement = nn.Sequential(*[
+            TransformerBlock(dim=dim*2, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=LayerNorm_type)
+            for _ in range(num_refinement_blocks)
+        ])
 
-    def forward(self, inp_img,noise_emb = None):
+        self.output = nn.Conv2d(dim*2, out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
 
-        inp_enc_level1 = self.patch_embed(inp_img)
+    def forward(self, inp_img, task_ids=None):
+        """
+        inp_img: [B, 3, H, W]
+        task_ids: [B], LongTensor, 任务ID索引
+        """
+
+        inp_enc_level1 = self.patch_embed(inp_img)  # [B, C, H, W]
+
+        # 任务嵌入注入：先判断是否传入task_ids
+        if task_ids is not None:
+            # print(f"Task IDs: {task_ids}")
+            task_feat = self.task_embed(task_ids)  # [B, C, H, W]
+            # 注意：如果输入patch_embed输出大小和task_feat尺寸不符，需要调整映射尺寸或插值
+            if task_feat.shape[-2:] != inp_enc_level1.shape[-2:]:
+                task_feat = F.interpolate(task_feat, size=inp_enc_level1.shape[-2:], mode='bilinear', align_corners=False)
+            inp_enc_level1 = inp_enc_level1 + task_feat  # 加法注入
 
         out_enc_level1 = self.encoder_level1(inp_enc_level1)
-        
         inp_enc_level2 = self.down1_2(out_enc_level1)
-
         out_enc_level2 = self.encoder_level2(inp_enc_level2)
-
+        if task_ids is not None:
+            task_vector = self.task_embed.get_embedding(task_ids)
+            out_enc_level2 = self.task_mod2(out_enc_level2, task_vector)
         inp_enc_level3 = self.down2_3(out_enc_level2)
-
-        out_enc_level3 = self.encoder_level3(inp_enc_level3) 
-
-        inp_enc_level4 = self.down3_4(out_enc_level3)        
-        latent = self.latent(inp_enc_level4) 
+        out_enc_level3 = self.encoder_level3(inp_enc_level3)
+        inp_enc_level4 = self.down3_4(out_enc_level3)
+        latent = self.latent(inp_enc_level4)
 
         if self.decoder:
             latent = self.fre1(inp_img, latent)
-      
-        inp_dec_level3 = self.up4_3(latent)
 
+        inp_dec_level3 = self.up4_3(latent)
         inp_dec_level3 = torch.cat([inp_dec_level3, out_enc_level3], 1)
         inp_dec_level3 = self.reduce_chan_level3(inp_dec_level3)
-
-        out_dec_level3 = self.decoder_level3(inp_dec_level3) 
+        out_dec_level3 = self.decoder_level3(inp_dec_level3)
 
         if self.decoder:
             out_dec_level3 = self.fre2(inp_img, out_dec_level3)
@@ -456,7 +540,6 @@ class AdaIR(nn.Module):
         inp_dec_level2 = self.up3_2(out_dec_level3)
         inp_dec_level2 = torch.cat([inp_dec_level2, out_enc_level2], 1)
         inp_dec_level2 = self.reduce_chan_level2(inp_dec_level2)
-
         out_dec_level2 = self.decoder_level2(inp_dec_level2)
 
         if self.decoder:
@@ -464,12 +547,11 @@ class AdaIR(nn.Module):
 
         inp_dec_level1 = self.up2_1(out_dec_level2)
         inp_dec_level1 = torch.cat([inp_dec_level1, out_enc_level1], 1)
-        
         out_dec_level1 = self.decoder_level1(inp_dec_level1)
 
         out_dec_level1 = self.refinement(out_dec_level1)
-
         out_dec_level1 = self.output(out_dec_level1) + inp_img
 
         return out_dec_level1
+
     
