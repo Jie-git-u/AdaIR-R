@@ -487,25 +487,40 @@ class TestSpecificDataset(Dataset):
     def __len__(self):
         return self.num_img
     
+
 class OfflineMixedTrainDataset(Dataset):
     def __init__(self, args):
         super().__init__()
         self.args = args
         self.gt_dir = os.path.join(args.offline_dir, 'HR')
         self.lr_dir = os.path.join(args.offline_dir, 'LR')
+        self.task2id = {'gsn': 0, 'sp': 1, 'ds': 2, 'mb': 3, 'gb': 4, 'jpeg': 5}
 
         self.degradation_suffixes = {
-            'gsn': '_gsn.png',   # 高斯噪声
-            'sp': '_sp.png',     # 椒盐噪声
-            'gb': '_gb.png',     # 高斯模糊
-            'mb': '_mb.png',     # 运动模糊
-            'jpeg': '_jpeg.png', # JPEG 压缩
-            'ds': '_ds.png',     # 下采样
+            'gsn': '_gsn.png',
+            'sp': '_sp.png',
+            'gb': '_gb.png',
+            'mb': '_mb.png',
+            'jpeg': '_jpeg.png',
+            'ds': '_ds.png',
         }
 
-        # 只保留 args.de_type 中声明的退化类型，确保传入参数是后缀键名，如 ['gsn', 'sp']
-        self.use_types = args.de_type
+        # ----------------------------
+        # 自动识别新旧任务 + 设置采样概率
+        # ----------------------------
+        self.new_task = args.de_type[0] if isinstance(args.de_type, list) else args.de_type
+
+        self.old_tasks = self._extract_old_tasks_from_ckpt(args.pretrained_ckpt) \
+            if args.pretrained_ckpt else []
+
+        self.all_tasks = list(dict.fromkeys([self.new_task] + self.old_tasks))  # 去重
+        print(f"自动采样任务集: {self.all_tasks}")
+
+        self.task_probs = self._compute_task_sampling_probs(new_task=self.new_task, all_tasks=self.all_tasks)
+        print(f"任务采样比例: {dict(zip(self.all_tasks, self.task_probs))}")
+
         self.patch_size = args.patch_size
+        self.toTensor = ToTensor()
 
         # 读取所有 HR 图像名
         self.image_names = sorted([
@@ -513,7 +528,23 @@ class OfflineMixedTrainDataset(Dataset):
             if f.lower().endswith(('.png', '.jpg', '.jpeg'))
         ])
 
-        self.toTensor = ToTensor()
+    def _extract_old_tasks_from_ckpt(self, ckpt_path):
+        import os, re
+        base = os.path.basename(ckpt_path)
+        match = re.match(r"([a-z_]+)-epoch=.*", base)
+        if not match:
+            return []
+        tasks = match.group(1).split('_')
+        return [t for t in tasks if t != self.new_task]
+
+    def _compute_task_sampling_probs(self, new_task, all_tasks):
+        new_ratio = 0.8
+        old_ratio_total = 1.0 - new_ratio
+        num_old = len(all_tasks) - 1
+        return [
+            new_ratio if t == new_task else old_ratio_total / num_old
+            for t in all_tasks
+        ]
 
     def __len__(self):
         return len(self.image_names)
@@ -524,45 +555,33 @@ class OfflineMixedTrainDataset(Dataset):
 
         clean_path = os.path.join(self.gt_dir, base_name)
 
-        # 随机选择退化任务
-        selected_type = random.choice(self.use_types)
+        # 🎯 根据采样概率选择任务
+        selected_type = random.choices(self.all_tasks, weights=self.task_probs, k=1)[0]
         suffix = self.degradation_suffixes[selected_type]
         degraded_name = name_no_ext + suffix
         degraded_path = os.path.join(self.lr_dir, degraded_name)
 
-        # 读取图像（PIL）
+        # 加载图像
         clean_img = Image.open(clean_path).convert('RGB')
         degraded_img = Image.open(degraded_path).convert('RGB')
+        assert clean_img.size == degraded_img.size
 
-        # 确保尺寸相同
-        assert clean_img.size == degraded_img.size, \
-            f"Size mismatch: {clean_path} vs {degraded_path}"
+        # 随机裁剪
+        w, h = clean_img.size
+        ps = self.patch_size
+        left = random.randint(0, w - ps)
+        top = random.randint(0, h - ps)
+        clean_crop = clean_img.crop((left, top, left + ps, top + ps))
+        degraded_crop = degraded_img.crop((left, top, left + ps, top + ps))
 
-        width, height = clean_img.size
-        crop_size = self.patch_size
-
-        # 随机选裁剪位置，保证合法
-        left = random.randint(0, width - crop_size)
-        top = random.randint(0, height - crop_size)
-        right = left + crop_size
-        bottom = top + crop_size
-
-        # 对 clean 和 degraded 同位置裁剪
-        clean_crop = clean_img.crop((left, top, right, bottom))
-        degraded_crop = degraded_img.crop((left, top, right, bottom))
-
-        # 转为 numpy
-        clean_np = np.array(clean_crop)
-        degraded_np = np.array(degraded_crop)
-
-        # 同时随机增强
-        clean_np, degraded_np = random_augmentation(clean_np, degraded_np)
-
-        # 转 tensor
+        # 增强 + 转 tensor
+        clean_np, degraded_np = random_augmentation(np.array(clean_crop), np.array(degraded_crop))
         clean_tensor = self.toTensor(clean_np)
         degraded_tensor = self.toTensor(degraded_np)
 
-        return [name_no_ext, selected_type], degraded_tensor, clean_tensor
+        task_id = self.task2id[selected_type]
+        return [name_no_ext, selected_type, task_id], degraded_tensor, clean_tensor
+
     
 class OfflineMixedTestDataset(Dataset):
     """
