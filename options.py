@@ -38,6 +38,11 @@ parser.add_argument('--ckpt_path', type=str, default="ckpt/Denoise/", help='chec
 parser.add_argument("--wblogger",type=str,default="AdaIR",help = "Determine to log to wandb or not and the project name")
 parser.add_argument("--ckpt_dir",type=str,default="AdaIR",help = "Name of the Directory where the checkpoint is to be saved")
 parser.add_argument("--num_gpus",type=int,default= 1, help = "Number of GPUs to use for training")
+parser.add_argument('--pretrained_ckpt', type=str, default=None, help='Path to pre-trained model checkpoint')
+parser.add_argument('--freeze_encoder', action='store_true', help='Whether to freeze encoder during transfer')
+parser.add_argument('--run_name', type=str, default='default_run', help='Name of this training run (used for logging, saving)')
+parser.add_argument('--freeze_ratio', type=float, default=1.0, help='冻结encoder的比例，范围为0.0（不冻结）到1.0（全部冻结）')
+
 
 options = parser.parse_args()
 
